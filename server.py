@@ -103,6 +103,15 @@ def get_filter_complex(corner):
     )
 
 
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({
+        "service": "yt-dlp-api",
+        "status": "ok",
+        "endpoints": ["/health", "/version", "/extract-frame", "/composite", "/generate-posts"],
+    })
+
+
 @app.route("/health", methods=["GET"])
 def health():
     deno_ok = subprocess.run(["deno", "--version"], capture_output=True).returncode == 0
