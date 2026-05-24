@@ -1,0 +1,252 @@
+from flask import Flask, request, jsonify, send_file
+import subprocess
+import os
+import tempfile
+import uuid
+from dataclasses import asdict
+
+from openai import APIError, APITimeoutError
+
+from viral_gen import GenerateRequest, VERSION as VIRAL_GEN_VERSION, run as viral_gen_run
+from viral_gen.pipeline import InvalidRequest
+
+app = Flask(__name__)
+cookies_path = "/app/cookies.txt"
+
+
+def get_cookies_flag():
+    if os.path.exists(cookies_path):
+        try:
+            with open(cookies_path, "r", encoding="utf-8", errors="ignore") as f:
+                if "Netscape HTTP Cookie File" in f.read(256):
+                    return ["--cookies", cookies_path]
+        except Exception:
+            pass
+    return []
+
+
+def get_direct_url(video_url):
+    formats_to_try = [
+        "best[ext=mp4]",
+        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
+        "bestvideo+bestaudio/best",
+        "best",
+    ]
+
+    cookies = get_cookies_flag()
+    last_error = ""
+
+    for fmt in formats_to_try:
+        cmd = [
+            "yt-dlp",
+            "--js-runtimes", "deno",
+            "--remote-components", "ejs:github",
+            "--extractor-args", "youtube:player_client=tv,web",
+            "-f", fmt,
+            "--get-url",
+        ] + cookies + [video_url]
+
+        print(f"Trying format: {fmt}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+        if result.returncode == 0 and result.stdout.strip():
+            url = result.stdout.strip().split("\n")[0]
+            if url.startswith("http"):
+                print(f"Success with format: {fmt}")
+                return url
+
+        last_error = result.stderr or ""
+        print(f"Failed format {fmt}: {last_error[-200:]}")
+
+        # Retry without cookies if cookie format error
+        if "does not look like a Netscape" in last_error:
+            cmd_no_cookies = [
+                "yt-dlp",
+                "--js-runtimes", "deno",
+                "--remote-components", "ejs:github",
+                "--extractor-args", "youtube:player_client=tv,web",
+                "-f", fmt,
+                "--get-url",
+                video_url,
+            ]
+            result = subprocess.run(cmd_no_cookies, capture_output=True, text=True, timeout=120)
+            if result.returncode == 0 and result.stdout.strip():
+                url = result.stdout.strip().split("\n")[0]
+                if url.startswith("http"):
+                    print(f"Success without cookies, format: {fmt}")
+                    return url
+            last_error = result.stderr or ""
+
+    raise Exception(f"yt-dlp failed all formats. Last error: {last_error[-500:]}")
+
+
+def get_filter_complex(corner):
+    face_crops = {
+        "bottom_left":  "crop=iw*0.15:ih*0.18:0:ih*0.68",
+        "bottom_right": "crop=iw*0.15:ih*0.18:iw*0.85:ih*0.68",
+        "top_left":     "crop=iw*0.15:ih*0.18:0:0",
+        "top_right":    "crop=iw*0.15:ih*0.18:iw*0.85:0",
+    }
+    chart_crops = {
+        "bottom_left":  "crop=iw*0.73:ih*0.87:iw*0.25:ih*0.05",
+        "bottom_right": "crop=iw*0.73:ih*0.87:iw*0.02:ih*0.05",
+        "top_left":     "crop=iw*0.73:ih*0.87:iw*0.25:ih*0.10",
+        "top_right":    "crop=iw*0.73:ih*0.87:iw*0.02:ih*0.10",
+    }
+    face_crop = face_crops.get(corner, face_crops["bottom_left"])
+    chart_crop = chart_crops.get(corner, chart_crops["bottom_left"])
+    return (
+        f"[0:v]split=2[v1][v2];"
+        f"[v1]{face_crop},scale=1080:570:force_original_aspect_ratio=increase,crop=1080:570[face];"
+        f"[v2]{chart_crop},scale=1080:1350:force_original_aspect_ratio=increase,crop=1080:1350[chart];"
+        f"[face][chart]vstack=inputs=2[out]"
+    )
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    deno_ok = subprocess.run(["deno", "--version"], capture_output=True).returncode == 0
+    yt_dlp_ver = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True)
+    return jsonify({
+        "status": "ok",
+        "deno_available": deno_ok,
+        "yt_dlp_version": yt_dlp_ver.stdout.strip() if yt_dlp_ver.returncode == 0 else "unknown",
+    })
+
+
+@app.route("/extract-frame", methods=["GET"])
+def extract_frame():
+    video_url = request.args.get("url")
+    time_sec = request.args.get("time", "10")
+    if not video_url:
+        return jsonify({"error": "Missing 'url' parameter"}), 400
+
+    output_id = str(uuid.uuid4())[:8]
+    output_path = os.path.join(tempfile.gettempdir(), f"frame_{output_id}.jpg")
+
+    try:
+        direct_url = get_direct_url(video_url)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(time_sec),
+        "-i", direct_url,
+        "-frames:v", "1",
+        "-q:v", "3",
+        output_path
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            return jsonify({"error": "FFmpeg frame extraction failed", "stderr": result.stderr[-300:]}), 500
+        return send_file(output_path, mimetype="image/jpeg")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+
+
+@app.route("/composite", methods=["GET"])
+def composite():
+    video_url = request.args.get("url")
+    if not video_url:
+        return jsonify({"error": "Missing 'url' parameter"}), 400
+
+    start = request.args.get("start", "0")
+    duration = request.args.get("duration", "30")
+    corner = request.args.get("corner", "bottom_left")
+
+    output_id = str(uuid.uuid4())
+    output_path = os.path.join(tempfile.gettempdir(), f"{output_id}.mp4")
+
+    try:
+        direct_url = get_direct_url(video_url)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    print(f"Compositing with facecam corner: {corner}")
+    filter_complex = get_filter_complex(corner)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(start),
+        "-i", direct_url,
+        "-t", str(duration),
+        "-filter_complex", filter_complex,
+        "-map", "[out]",
+        "-map", "0:a?",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        "-threads", "2",
+        output_path
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            return jsonify({
+                "error": "FFmpeg failed",
+                "stderr": result.stderr[-500:]
+            }), 500
+
+        return send_file(
+            output_path,
+            mimetype="video/mp4",
+            as_attachment=True,
+            download_name=f"clip_{output_id}.mp4"
+        )
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Processing timed out"}), 504
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+
+
+@app.route("/generate-posts", methods=["POST"])
+def generate_posts():
+    body = request.get_json(silent=True) or {}
+    try:
+        req = GenerateRequest(
+            topic=body.get("topic", ""),
+            tone=body.get("tone"),
+            audience=body.get("audience"),
+            format=body.get("format", "single"),
+            model=body.get("model", "claude-sonnet-4-6"),
+            grader_model=body.get("grader_model"),
+            n=int(body.get("n", 12)),
+            top_k=int(body.get("top_k", 5)),
+            weights=body.get("weights"),
+        )
+        ranked = viral_gen_run(req)
+    except InvalidRequest as e:
+        return jsonify({"error": str(e)}), 400
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 500
+    except APITimeoutError as e:
+        return jsonify({"error": f"LLM timeout: {e}"}), 504
+    except APIError as e:
+        return jsonify({"error": f"LLM error: {e}"}), 502
+
+    results = [asdict(r) for r in ranked]
+    for item in results:
+        item["version"] = VIRAL_GEN_VERSION
+    return jsonify(results)
+
+
+@app.route("/version", methods=["GET"])
+def version():
+    return jsonify({"service": "viral_gen", "version": VIRAL_GEN_VERSION})
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
